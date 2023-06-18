@@ -2,11 +2,11 @@
 
 #for examples
 # Current  version
-VERSION ?=latest
+VERSION ?=4.14
 # Default image tag
 
-IMG ?= quay.io/openshift/origin-cloud-event-proxy:$(VERSION)
-CONSUMER_IMG ?= quay.io/redhat-cne/cloud-event-consumer:$(VERSION)
+IMG ?= quay.io/vgrinber/cloud-event-proxy:$(VERSION)
+CONSUMER_IMG ?= quay.io/vgrinber/cloud-event-consumer:$(VERSION)
 
 # Export GO111MODULE=on to enable project to be built from within GOPATH/src
 export GO111MODULE=on
