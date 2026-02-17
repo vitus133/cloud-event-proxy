@@ -23,6 +23,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"syscall"
 
 	"k8s.io/utils/pointer"
 
@@ -73,6 +74,35 @@ var (
 	notifyConfigDirUpdates chan *ptp4lconf.PtpConfigUpdate
 	fileWatcher            *ptp4lconf.Watcher
 )
+
+// restartProcess replaces the current process with a fresh copy of itself via
+// syscall.Exec. This guarantees all in-memory state (metrics, stats, holdover
+// goroutines, interface roles, etc.) is fully reset, equivalent to a container
+// restart but without Kubernetes involvement.
+func restartProcess(reason string) {
+	log.Infof("configuration change detected (%s), restarting process for clean state...", reason)
+
+	// Remove the Unix socket file so the new process can bind cleanly.
+	// The socket Listen() also handles stale sockets as a safety net.
+	if err := os.Remove(eventSocket); err != nil && !os.IsNotExist(err) {
+		log.Warningf("failed to remove socket file %s: %v", eventSocket, err)
+	}
+
+	// Close the file watcher to release inotify resources
+	if fileWatcher != nil {
+		fileWatcher.Close()
+	}
+
+	binary, err := os.Executable()
+	if err != nil {
+		log.Fatalf("failed to get executable path for restart: %v", err)
+	}
+
+	log.Infof("restarting: %s %v", binary, os.Args)
+	if err := syscall.Exec(binary, os.Args, os.Environ()); err != nil {
+		log.Fatalf("failed to restart process: %v", err)
+	}
+}
 
 // Start ptp plugin to process events,metrics and status, expects rest api available to create publisher and subscriptions
 func Start(wg *sync.WaitGroup, configuration *common.SCConfiguration, _ func(e interface{}) error) error { //nolint:deadcode,unused
@@ -125,10 +155,19 @@ func Start(wg *sync.WaitGroup, configuration *common.SCConfiguration, _ func(e i
 	// get threshold data on change of ptp config
 	// update node profile when configmap changes
 	go func() {
+		initialConfigLoaded := false
 		for {
 			select {
 			case <-eventManager.PtpConfigMapUpdates.UpdateCh:
-				log.Infof("updating ptp profile changes %d", len(eventManager.PtpConfigMapUpdates.NodeProfiles))
+				// After the initial config load, any subsequent config change
+				// triggers a full process restart via syscall.Exec to guarantee
+				// all in-memory state is clean. This eliminates stale-state bugs
+				// that occur when configs are deleted and re-applied.
+				if initialConfigLoaded {
+					restartProcess("ptp configmap profile changed")
+					return // unreachable after exec, but for clarity
+				}
+				log.Infof("initial config load: updating ptp profile changes %d", len(eventManager.PtpConfigMapUpdates.NodeProfiles))
 				// clean up when no profiles found in configmap
 				if len(eventManager.PtpConfigMapUpdates.NodeProfiles) == 0 {
 					log.Infof("Zero Profile to update: cleaning up threshold")
@@ -161,6 +200,7 @@ func Start(wg *sync.WaitGroup, configuration *common.SCConfiguration, _ func(e i
 							"threshold": "HoldOverTimeout", "node": nodeName, "profile": key}).Set(float64(np.HoldOverTimeout))
 					}
 				}
+				initialConfigLoaded = true
 			case <-config.CloseCh:
 				return
 			}
