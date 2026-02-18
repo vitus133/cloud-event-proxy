@@ -183,6 +183,30 @@ RESTART
 
 Any line that equals exactly `RESTART` triggers `restartProcess()`. All other lines are passed to `ExtractMetrics()` as before.
 
+### Socket Lifecycle During Restart
+
+The sidecar is the socket **server** (listener); the daemon is the **client** (connector). During a restart the socket is torn down and recreated:
+
+1. Sidecar receives `RESTART` in `processMessages()`
+2. `restartProcess()` removes the socket file `/cloud-native/events.sock`
+3. `syscall.Exec` replaces the process -- all file descriptors (including the listening socket) are closed
+4. Fresh sidecar starts, calls `listenToSocket()` → `socket.Listen()` creates a new socket file
+5. Daemon's existing connections are now broken (peer closed)
+6. Daemon detects write errors on next log line and reconnects
+
+**The daemon already has reconnect logic on its main write paths.** Specifically:
+
+| Daemon write path | Reconnect on error? | How |
+|---|---|---|
+| Process stdout logs (`cmdRun` in `daemon.go`) | **Yes** | `goto connect` on write error → redials |
+| EventHandler (`ProcessEvents` in `event.go`) | **Yes** | `goto connect` on write error → redials |
+| `/emit-logs` handler (`ready.go`) | N/A | Opens a fresh connection per request |
+| `EmitProcessStatusLogs` | Partial | Retries dial only when `proc.c == nil`; does not detect broken connections. Minor gap, but `proc.c` is refreshed when `cmdRun` reconnects or when processes restart. |
+
+**Reconnect is also natural because `applyNodePTPProfiles()` restarts all PTP processes.** New `cmdRun` goroutines create fresh socket connections from scratch, so even without the write-error retry path, all connections are refreshed.
+
+**Transient unavailability window:** Between when the old sidecar removes the socket file and the new sidecar creates it, daemon connection attempts will fail. The daemon's retry loops (with `connectionRetryInterval` sleeps) handle this gracefully. The window is very short (milliseconds for `syscall.Exec` + socket bind).
+
 ### Why No Additional Commands Are Needed
 
 **No CONFIG message needed.** The sidecar reads configuration from two filesystem sources on startup (ConfigMap and config files). Both are written by the daemon before it sends `RESTART`, so they're guaranteed to be consistent and available when the sidecar restarts.
@@ -515,12 +539,30 @@ Since `RESTART` is sent at the end of `ApplyNodePTPProfiles()`, it covers all co
 
 ### Guarantee Required
 
-All config files must be written to `/var/run/` **BEFORE** sending `RESTART`. This is naturally satisfied by placing the send at the end of `ApplyNodePTPProfiles()`, which writes all config files before returning.
+All config files must be written to `/var/run/` **BEFORE** sending `RESTART`. This is naturally satisfied by placing the send at the end of `applyNodePTPProfiles()`, which writes all config files and starts processes before returning.
 
-### Example
+### How to Send the RESTART Command
+
+`applyNodePTPProfiles()` does not hold a socket connection itself -- socket connections are owned by individual process `cmdRun` goroutines and the `EventHandler`. The `RESTART` command should be sent via a **short-lived dedicated connection** (similar to how the `/emit-logs` handler works in `ready.go`):
 
 ```go
-func (dn *Daemon) ApplyNodePTPProfiles() {
+func sendRestart() error {
+    c, err := net.Dial("unix", eventSocket)
+    if err != nil {
+        return fmt.Errorf("failed to connect to event socket for restart: %w", err)
+    }
+    defer c.Close()
+    _, err = c.Write([]byte("RESTART\n"))
+    return err
+}
+```
+
+This avoids coupling to any process's connection lifecycle. The connection is opened, the command is written, and the connection is closed. The sidecar's `processMessages()` goroutine for this connection will read `RESTART` and trigger `restartProcess()`.
+
+### Example Integration
+
+```go
+func (dn *Daemon) applyNodePTPProfiles() error {
     // ... existing logic:
     //   - stop old processes
     //   - write new config files to /var/run/
@@ -529,9 +571,16 @@ func (dn *Daemon) ApplyNodePTPProfiles() {
 
     // All config files written and processes started.
     // Tell the sidecar to restart and re-read configuration.
-    sendToSocket("RESTART\n")
+    if err := sendRestart(); err != nil {
+        glog.Warningf("failed to send RESTART to sidecar: %v", err)
+        // Non-fatal: sidecar will continue with stale config until next restart.
+        // This can happen if the sidecar hasn't started yet (initial boot).
+    }
+    return nil
 }
 ```
+
+Note: The error is logged but not fatal. On initial daemon startup, the sidecar may not be listening yet, so the `RESTART` send will fail. This is fine -- the sidecar will load whatever configs exist when it starts, and the daemon's process log writers will reconnect to the sidecar naturally.
 
 ---
 
