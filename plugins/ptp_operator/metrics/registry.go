@@ -205,6 +205,20 @@ func DeletedPTPMetrics(clockType, processName, eventResourceName string) {
 		"process": processName, "node": ptpNodeName, "iface": eventResourceName})
 }
 
+// DeleteClockClassMetricsForConfig removes clock class metrics for a deleted config.
+func DeleteClockClassMetricsForConfig(process, configName string) {
+	ClockClassMetrics.Delete(prometheus.Labels{
+		"process": process,
+		"config":  configName,
+		"node":    ptpNodeName,
+	})
+}
+
+// DeleteAllClockClassMetricsForNode removes all clock class metrics for the current node.
+func DeleteAllClockClassMetricsForNode() {
+	ClockClassMetrics.DeletePartialMatch(prometheus.Labels{"node": ptpNodeName})
+}
+
 // DeleteThresholdMetrics ... delete threshold metrics
 func DeleteThresholdMetrics(profile string) {
 	Threshold.Delete(prometheus.Labels{
